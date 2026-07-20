@@ -27,6 +27,19 @@ the image manipulation library, with a selectable backend driver: **GD**, **Imag
 
 ## Installation
 
+### Option A: Release zip (recommended, no composer needed)
+
+1. Download the `ImageSizerEngineIntervention-<version>.zip` asset from the
+   [Releases](../../releases) page — it already includes the `vendor/` directory, so no `composer install`
+   step is required.
+2. Extract it into `site/modules/`, so that the module ends up at
+   `site/modules/ImageSizerEngineIntervention`.
+3. In the ProcessWire admin, go to **Modules > Refresh**, then install **Intervention Image Sizer**
+   (`ImageSizerEngineIntervention`).
+4. Configure the module (driver selection, memory limit, debug logging) under its module settings page.
+
+### Option B: From source (requires composer)
+
 1. Make sure this directory is at `site/modules/ImageSizerEngineIntervention`.
 2. Install PHP dependencies:
    ```bash
