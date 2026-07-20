@@ -28,7 +28,7 @@ class ImageSizerEngineIntervention extends ImageSizerEngine {
 	public static function getModuleInfo(): array {
 		return [
 			'title' => 'Intervention Image Sizer',
-			'version' => 2,
+			'version' => 10,
 			'summary' => 'Image manipulation using Intervention Image v4 with selectable GD, Imagick, or libvips driver.',
 			'author' => 'Kevin Stieglitz',
 			'autoload' => false,
