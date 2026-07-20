@@ -1,0 +1,29 @@
+{
+  "name": "kvn-stgl/imagesizer-engine-intervention",
+  "description": "",
+  "type": "pw-module",
+  "keywords": [
+    "wire",
+    "intervention",
+    "image"
+  ],
+  "homepage": "https://github.com/trk/InterventionImage",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Kevin Stieglitz"
+    }
+  ],
+  "require": {
+    "php": ">=8.3",
+    "intervention/image": "^4",
+    "intervention/image-driver-vips": "^4.0"
+  },
+  "config": {
+    "process-timeout": 0,
+    "allow-plugins": {
+      "hari/pw-module": true
+    }
+  },
+  "minimum-stability": "stable"
+}

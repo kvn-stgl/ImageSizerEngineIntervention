@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag, e.g. v1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag format
+        id: validate
+        run: |
+          raw="${{ inputs.tag }}"
+          version_core="${raw#v}"
+          if [[ ! "$version_core" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$raw' is not in the expected format vMAJOR.MINOR.PATCH (e.g. v1.0.0)"
+            exit 1
+          fi
+          echo "tag=v${version_core}" >> "$GITHUB_OUTPUT"
+          echo "version_core=${version_core}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute version number
+        id: version
+        run: |
+          IFS='.' read -r major minor patch <<< "${{ steps.validate.outputs.version_core }}"
+          version=$((10#$major * 100 + 10#$minor * 10 + 10#$patch))
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag does not already exist
+        run: |
+          if git ls-remote --tags origin | grep -q "refs/tags/${{ steps.validate.outputs.tag }}$"; then
+            echo "::error::Tag ${{ steps.validate.outputs.tag }} already exists"
+            exit 1
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Create release branch
+        run: git checkout -b "release/${{ steps.version.outputs.version }}"
+
+      - name: Update version in module info
+        run: |
+          sed -i -E "s/'version'[[:space:]]*=>[[:space:]]*[0-9]+,/'version' => ${{ steps.version.outputs.version }},/" ImageSizerEngineIntervention.module
+
+      - name: Update CHANGELOG.md
+        run: |
+          today=$(date +%Y-%m-%d)
+          heading="## [${{ steps.version.outputs.version }}] - ${today}"
+          sed -i "s/^## Unreleased$/${heading}/" CHANGELOG.md
+
+          # extract the body of this version's section (until the next "## " heading) for the release notes
+          awk -v heading="$heading" '
+            $0 == heading { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ImageSizerEngineIntervention.module CHANGELOG.md
+          git commit -m "Release ${{ steps.validate.outputs.tag }} (version ${{ steps.version.outputs.version }})"
+          git push origin "release/${{ steps.version.outputs.version }}"
+
+      - name: Create tag
+        run: |
+          git tag "${{ steps.validate.outputs.tag }}"
+          git push origin "${{ steps.validate.outputs.tag }}"
+
+      - name: Create pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pr_url=$(gh pr create \
+            --base main \
+            --head "release/${{ steps.version.outputs.version }}" \
+            --title "Release ${{ steps.validate.outputs.tag }}" \
+            --body "Automated release PR for tag \`${{ steps.validate.outputs.tag }}\` (module version \`${{ steps.version.outputs.version }}\`).")
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge "${{ steps.pr.outputs.pr_url }}" --auto --merge
+
+      - name: Install PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+
+      - name: Install composer dependencies
+        run: composer install --no-dev --optimize-autoloader
+
+      - name: Build release archive
+        run: |
+          dirname="ImageSizerEngineIntervention"
+          archive="ImageSizerEngineIntervention-${{ steps.validate.outputs.tag }}.zip"
+          mkdir -p /tmp/release/"$dirname"
+          rsync -a --exclude='.git' --exclude='.github' ./ /tmp/release/"$dirname"/
+          (cd /tmp/release && zip -r "$GITHUB_WORKSPACE/$archive" "$dirname")
+          echo "archive=$archive" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.validate.outputs.tag }}" \
+            "${{ env.archive }}" \
+            --title "${{ steps.validate.outputs.tag }}" \
+            --notes-file /tmp/release-notes.md

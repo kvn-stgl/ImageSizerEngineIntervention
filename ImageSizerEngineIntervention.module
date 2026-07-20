@@ -1,0 +1,459 @@
+<?php namespace ProcessWire;
+
+use Intervention\Image\ImageManager;
+use Intervention\Image\Interfaces\ImageManagerInterface;
+use Intervention\Image\Drivers\Gd\Driver as GdDriver;
+use Intervention\Image\Drivers\Imagick\Driver as ImagickDriver;
+use Intervention\Image\Drivers\Vips\Driver as VipsDriver;
+use Intervention\Image\Interfaces\ImageInterface;
+use Intervention\Image\Encoders\JpegEncoder;
+use Intervention\Image\Encoders\PngEncoder;
+use Intervention\Image\Encoders\GifEncoder;
+use Intervention\Image\Encoders\WebpEncoder;
+use Intervention\Image\Encoders\AvifEncoder;
+use Intervention\Image\Direction;
+
+if (!class_exists('Intervention\Image\ImageManager')) require __DIR__ . "/vendor/autoload.php";
+
+/**
+ * ImageSizerEngineIntervention
+ *
+ * ProcessWire ImageSizerEngine using Intervention Image v4.
+ * Supports GD, Imagick, and libvips as selectable backend drivers.
+ *
+ * @method bool imSaveReady($image, $filename)
+ */
+class ImageSizerEngineIntervention extends ImageSizerEngine {
+
+	public static function getModuleInfo(): array {
+		return [
+			'title' => 'Intervention Image Sizer',
+			'version' => 2,
+			'summary' => 'Image manipulation using Intervention Image v4 with selectable GD, Imagick, or libvips driver.',
+			'author' => 'Kevin Stieglitz',
+			'autoload' => false,
+			'singular' => false,
+		];
+	}
+
+	protected ?ImageInterface $im = null;
+	protected string $imageFormat = '';
+	protected int $imageDepth = 0;
+	protected ?string $originalMemoryLimit = null;
+
+	public function __construct() {
+		$this->set('interventionDriver', 'gd');
+		$this->set('interventionDebug', 0);
+		$this->set('interventionMemoryLimit', '');
+		$this->set('interventionMemoryLimitAnimatedOnly', 0);
+		parent::__construct();
+	}
+
+	protected function debugLog(string $message): void {
+		if(!$this->interventionDebug) return;
+		$this->wire()->log->save('intervention-image', $message);
+	}
+
+	protected function imagickVersion(): string|false {
+		if(!class_exists('\\Imagick')) return false;
+		return (new \Imagick())->getVersion()['versionString'];
+	}
+
+	protected function vipsVersion(): string|false {
+		if(!class_exists('\\Jcupitt\\Vips\\Config')) {
+			$autoload = __DIR__ . '/vendor/autoload.php';
+			if(file_exists($autoload)) require_once $autoload;
+		}
+		if(!class_exists('\\Jcupitt\\Vips\\Config')) return false;
+		try {
+			return \Jcupitt\Vips\Config::version();
+		} catch(\Exception) {
+			return false;
+		}
+	}
+
+	protected function getDriverClass(): string {
+		$driver = $this->interventionDriver ?: 'gd';
+		return match($driver) {
+			'imagick' => ImagickDriver::class,
+			'vips'    => VipsDriver::class,
+			default   => GdDriver::class,
+		};
+	}
+
+	protected function createManager(): ImageManagerInterface {
+		return ImageManager::usingDriver($this->getDriverClass(), autoOrientation: false);
+	}
+
+	protected function validSourceImageFormats(): array {
+		$driver = $this->interventionDriver ?: 'gd';
+		$base = ['JPG', 'JPEG', 'PNG24', 'PNG', 'GIF', 'GIF87', 'WEBP'];
+
+		if($driver === 'imagick' || $driver === 'vips') {
+			$base = array_merge($base, ['AVIF', 'TIFF', 'HEIC', 'HEIF']);
+		}
+
+		return $base;
+	}
+
+	protected function validTargetImageFormats(): array {
+		return $this->validSourceImageFormats();
+	}
+
+	public function getLibraryVersion(): string {
+		$driver = $this->interventionDriver ?: 'gd';
+		$driverLabel = match($driver) {
+			'imagick' => 'Imagick',
+			'vips'    => 'libvips',
+			default   => 'GD',
+		};
+		$version = \Composer\InstalledVersions::getPrettyVersion('intervention/image');
+		return "Intervention Image $version ($driverLabel)";
+	}
+
+	protected function driverSupportsFormat(string $format): bool {
+		$driver = $this->interventionDriver ?: 'gd';
+		$format = strtolower($format);
+
+		if($driver === 'imagick') {
+			if($this->imagickVersion() === false) return false;
+			$supported = array_map('strtolower', \Imagick::queryFormats());
+			return in_array($format, $supported);
+		}
+
+		if($driver === 'vips') {
+			return $this->vipsVersion() !== false;
+		}
+
+		// GD: check compiled-in support
+		$gdInfo = gd_info();
+		return match($format) {
+			'jpg', 'jpeg' => !empty($gdInfo['JPEG Support']),
+			'png'         => !empty($gdInfo['PNG Support']),
+			'gif'         => !empty($gdInfo['GIF Read Support']),
+			'webp'        => !empty($gdInfo['WebP Support']),
+			'avif'        => !empty($gdInfo['AVIF Support']),
+			default       => false,
+		};
+	}
+
+	public function supported($action = 'imageformat') {
+		return match($action) {
+			'install' => (function() {
+				try { $this->createManager(); return true; } catch(\Exception) { return false; }
+			})(),
+			'imageformat' => $this->supported('install'),
+			'webp' => $this->driverSupportsFormat('webp'),
+			default => false,
+		};
+	}
+
+	protected function processResize($srcFilename, $dstFilename, $fullWidth, $fullHeight, $finalWidth, $finalHeight) {
+		$this->modified = false;
+		if(isset($this->info['bits'])) $this->imageDepth = (int) $this->info['bits'];
+		$this->imageFormat = strtoupper(str_replace('image/', '', $this->info['mime']));
+
+		if(!in_array($this->imageFormat, $this->validSourceImageFormats())) {
+			throw new WireException(sprintf($this->_("loaded file '%s' is not in the list of valid images"), basename($dstFilename)));
+		}
+
+		$this->debugLog("processResize: src=$srcFilename, dst=$dstFilename, {$fullWidth}x{$fullHeight} → {$finalWidth}x{$finalHeight}, format=$this->imageFormat, driver=" . $this->getDriverClass());
+
+		$manager = $this->createManager();
+
+		try {
+			$this->im = $manager->decodePath($srcFilename);
+		} catch(\Exception $e) {
+			$this->debugLog("processResize: failed to read $srcFilename — " . $e->getMessage());
+			return false;
+		}
+
+		$this->applyMemoryLimit($this->im);
+
+		$orientations = null;
+		$needRotation = !($this->autoRotation !== true) && $this->checkOrientation($orientations) &&
+			(!empty($orientations[0]) || !empty($orientations[1]));
+
+		if($needRotation && $this->autoRotation) {
+			$this->debugLog("processResize: auto-orient applied");
+			$this->im->orient();
+			if(!empty($orientations[0])) {
+				$degrees = $orientations[0];
+				if(abs($degrees) == 90 || abs($degrees) == 270) {
+					[$w, $h] = [$this->getWidth(), $this->getHeight()];
+					$this->setImageInfo($h, $w);
+				}
+			}
+		}
+
+		if($this->rotate) {
+			$this->debugLog("processResize: rotate {$this->rotate}°");
+			$this->im->rotate($this->rotate);
+			if(abs($this->rotate) == 90 || abs($this->rotate) == 270) {
+				[$w, $h] = [$this->getWidth(), $this->getHeight()];
+				$this->setImageInfo($h, $w);
+			}
+		}
+
+		if($this->flip) {
+			$this->debugLog("processResize: flip={$this->flip}");
+			$this->im->flip($this->flip === 'v' ? Direction::VERTICAL : Direction::HORIZONTAL);
+		}
+
+		$zoom = $this->getFocusZoomPercent();
+		if($zoom > 1) {
+			$this->cropExtra = $this->getFocusZoomCropDimensions($zoom, $fullWidth, $fullHeight, $finalWidth, $finalHeight);
+			$this->cropping = false;
+		}
+
+		if(is_array($this->cropExtra) && count($this->cropExtra) === 4) {
+			[$x, $y, $w, $h] = $this->cropExtra;
+			$this->debugLog("processResize: cropExtra x=$x, y=$y, w=$w, h=$h");
+			$this->im->crop($w, $h, $x, $y);
+			$this->setImageInfo($this->im->width(), $this->im->height());
+		}
+
+		$bgX = $bgY = 0;
+		$bgWidth = $fullWidth;
+		$bgHeight = $fullHeight;
+		$resizeMethod = $this->getResizeMethod($bgWidth, $bgHeight, $finalWidth, $finalHeight, $bgX, $bgY);
+		$this->debugLog("processResize: resizeMethod=$resizeMethod, bg={$bgWidth}x{$bgHeight}, bgOffset=$bgX,$bgY");
+
+		if($resizeMethod === 0) {
+			$this->sharpening = 'none';
+		} else if($resizeMethod === 2) {
+			$this->im->resize($finalWidth, $finalHeight);
+			$this->setImageInfo($this->im->width(), $this->im->height());
+		} else if($resizeMethod === 4) {
+			$this->im->resize($bgWidth, $bgHeight);
+			$this->im->crop($finalWidth, $finalHeight, $bgX, $bgY);
+			$this->setImageInfo($this->im->width(), $this->im->height());
+		}
+
+		if($this->sharpening && $this->sharpening !== 'none') {
+			$amount = $this->sharpeningToAmount($this->sharpening);
+			if($amount > 0) {
+				$this->debugLog("processResize: sharpen mode={$this->sharpening}, amount=$amount");
+				$this->im->sharpen($amount);
+			}
+		}
+
+		$this->imSaveReady($this->im, $srcFilename);
+
+		if($this->webpOnly) {
+			$this->debugLog("processResize: webpOnly mode, skipping original format");
+			$this->im = null;
+			return $this->webpResult;
+		}
+
+		if(file_exists($dstFilename)) $this->wire()->files->unlink($dstFilename);
+
+		try {
+			$result = $this->saveImage($this->im, $dstFilename);
+			$this->debugLog("processResize: saved $dstFilename, result=" . ($result ? 'ok' : 'fail'));
+		} catch(\Exception $e) {
+			$this->debugLog("processResize: save failed — " . $e->getMessage());
+			$this->im = null;
+			return false;
+		}
+
+		$this->im = null;
+		return $result;
+	}
+
+	protected function sharpeningToAmount(string $mode): int {
+		return match($mode) {
+			'strong' => 30,
+			'medium' => 20,
+			'soft'   => 10,
+			default  => 0,
+		};
+	}
+
+	protected function saveImage(ImageInterface $image, string $filename): bool {
+		$ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+
+		$encoded = match($ext) {
+			'jpg', 'jpeg' => $image->encode(new JpegEncoder(quality: $this->quality, progressive: $this->interlace)),
+			'png'         => $image->encode(new PngEncoder(interlaced: $this->interlace)),
+			'gif'         => $image->encode(new GifEncoder(interlaced: $this->interlace)),
+			'webp'        => $image->encode(new WebpEncoder(quality: $this->quality)),
+			'avif'        => $image->encode(new AvifEncoder(quality: $this->quality)),
+			'tiff', 'tif',
+			'heic', 'heif' => $image->encodeUsingFileExtension($ext),
+			default        => null,
+		};
+
+		if($encoded === null) return false;
+
+		$encoded->save($filename);
+		return true;
+	}
+
+	protected function ___imSaveReady(ImageInterface $image, string $filename): bool {
+		if($this->webpOnly || $this->webpAdd) {
+			$this->webpResult = $this->saveWebP($image, $filename, $this->webpQuality);
+		}
+		return !$this->webpOnly;
+	}
+
+	protected function saveWebP(ImageInterface $image, string $filename, int $quality = 90): bool {
+		$pathParts = pathinfo($filename);
+		$webpFilename = $pathParts['dirname'] . '/' . $pathParts['filename'] . '.webp';
+		if(file_exists($webpFilename)) $this->wire()->files->unlink($webpFilename);
+
+		try {
+			$image->encode(new WebpEncoder(quality: $quality))->save($webpFilename);
+			return true;
+		} catch(\Exception) {
+			return false;
+		}
+	}
+
+	protected function applyMemoryLimit(ImageInterface $image): void {
+		if(!$this->interventionMemoryLimit) return;
+		if($this->interventionMemoryLimitAnimatedOnly && !$image->isAnimated()) return;
+		if($this->originalMemoryLimit === null) $this->originalMemoryLimit = get_cfg_var('memory_limit');
+		$this->debugLog("applyMemoryLimit: memory_limit set to {$this->interventionMemoryLimit} (was {$this->originalMemoryLimit}, animated=" . ($image->isAnimated() ? 'yes' : 'no') . ")");
+		ini_set('memory_limit', $this->interventionMemoryLimit);
+	}
+
+	protected function processRotate($srcFilename, $dstFilename, $degrees) {
+		try {
+			$image = $this->createManager()->decodePath($srcFilename);
+			$this->applyMemoryLimit($image);
+			$image->rotate($degrees);
+			if(empty($dstFilename)) $dstFilename = $srcFilename;
+			if(file_exists($dstFilename)) $this->wire()->files->unlink($dstFilename);
+			return $this->saveImage($image, $dstFilename);
+		} catch(\Exception) {
+			return false;
+		}
+	}
+
+	protected function processFlip($srcFilename, $dstFilename, $flipVertical) {
+		try {
+			$image = $this->createManager()->decodePath($srcFilename);
+			$this->applyMemoryLimit($image);
+
+			match($flipVertical) {
+				'vertical'   => $image->flip(Direction::VERTICAL),
+				'horizontal' => $image->flip(Direction::HORIZONTAL),
+				default      => ($image->flip(Direction::VERTICAL) && $image->flip(Direction::HORIZONTAL)),
+			};
+
+			if(empty($dstFilename)) $dstFilename = $srcFilename;
+			if(file_exists($dstFilename)) $this->wire()->files->unlink($dstFilename);
+			return $this->saveImage($image, $dstFilename);
+		} catch(\Exception) {
+			return false;
+		}
+	}
+
+	public function convertToGreyscale($dstFilename = '') {
+		try {
+			$image = $this->createManager()->decodePath($this->filename);
+			$this->applyMemoryLimit($image);
+			$image->grayscale();
+			if(empty($dstFilename)) $dstFilename = $this->filename;
+			if(file_exists($dstFilename)) $this->wire()->files->unlink($dstFilename);
+			return $this->saveImage($image, $dstFilename);
+		} catch(\Exception) {
+			return false;
+		}
+	}
+
+	public function convertToSepia($dstFilename = '', $sepia = 55) {
+		try {
+			$image = $this->createManager()->decodePath($this->filename);
+			$this->applyMemoryLimit($image);
+			$image->grayscale();
+			$image->colorize(red: 38, green: (int) ($sepia * 0.4), blue: 12);
+			if(empty($dstFilename)) $dstFilename = $this->filename;
+			if(file_exists($dstFilename)) $this->wire()->files->unlink($dstFilename);
+			return $this->saveImage($image, $dstFilename);
+		} catch(\Exception) {
+			return false;
+		}
+	}
+
+	/**
+	 * Module install
+	 *
+	 * @throws WireException
+	 *
+	 */
+	public function ___install() {
+		if(!extension_loaded('gd')) {
+			throw new WireException($this->_("This module requires PHP's GD extension to be installed (required as the default driver)."));
+		}
+	}
+
+	public function getModuleConfigInputfields(InputfieldWrapper $inputfields): void {
+		parent::getModuleConfigInputfields($inputfields);
+
+		$f = $inputfields->InputfieldSelect;
+		$f->attr('name', 'interventionDriver');
+		$f->label = $this->_('Intervention Image Driver');
+		$f->description = $this->_('Select the image processing backend. GD is always available. Imagick and libvips require their respective PHP extensions.');
+		$f->addOption('gd', 'GD Library');
+		if($this->imagickVersion() !== false) $f->addOption('imagick', 'Imagick (ImageMagick)');
+		if($this->vipsVersion() !== false) $f->addOption('vips', 'libvips');
+		$f->attr('value', $this->interventionDriver ?: 'gd');
+		$f->icon = 'cogs';
+		$inputfields->add($f);
+
+		$hasFfi = extension_loaded('ffi');
+		$ffiEnabled = ini_get('ffi.enable');
+		$ffiStatus = !$hasFfi
+			? $this->_('not installed')
+			: match($ffiEnabled) {
+				'1', 'true', 'on' => $this->_('enabled'),
+				'preload'         => $this->_('preload only (set ffi.enable=true for libvips)'),
+				default           => $this->_('disabled (set ffi.enable=true for libvips)'),
+			};
+		$currentMemory = ini_get('memory_limit');
+		$lines = [
+			'<strong>GD</strong>: ' . $this->_('always available'),
+			'<strong>Imagick</strong>: ' . (($v = $this->imagickVersion()) !== false ? $this->_('installed') . ' ' . $v : $this->_('not installed')),
+			'<strong>libvips</strong>: ' . (($v = $this->vipsVersion()) !== false ? $this->_('installed') . ' ' . $v : $this->_('not installed'))
+				. ' &nbsp;|&nbsp; <strong>FFI</strong>: ' . $ffiStatus,
+			'<strong>memory_limit</strong>: ' . $currentMemory,
+		];
+		$f = $inputfields->InputfieldMarkup;
+		$f->label = $this->_('Extension Status');
+		$f->icon = 'info-circle';
+		$f->value = '<ul style="margin:0;padding-left:1.25em">'
+			. implode('', array_map(fn(string $line) => "<li>$line</li>", $lines))
+			. '</ul>';
+		$inputfields->add($f);
+
+		$f = $inputfields->InputfieldSelect;
+		$f->attr('name', 'interventionMemoryLimit');
+		$f->label = $this->_('Memory Limit for Image Processing');
+		$f->description = $this->_('Temporarily raise the PHP memory_limit during image resize. Current value: ' . $currentMemory . '. Leave empty to keep the current limit.');
+		$f->addOption('', $this->_('— keep current (' . $currentMemory . ') —'));
+		foreach(['128M', '256M', '512M', '1G', '2G'] as $limit) {
+			$f->addOption($limit, $limit);
+		}
+		$f->attr('value', $this->interventionMemoryLimit ?: '');
+		$f->icon = 'dashboard';
+		$inputfields->add($f);
+
+		$f = $inputfields->InputfieldCheckbox;
+		$f->attr('name', 'interventionMemoryLimitAnimatedOnly');
+		$f->label = $this->_('Apply memory limit only for animated images');
+		$f->description = $this->_('When checked, the memory limit above is only applied when the source image is animated (e.g. animated GIF/WebP).');
+		$f->attr('checked', $this->interventionMemoryLimitAnimatedOnly ? 'checked' : '');
+		$f->icon = 'film';
+		$inputfields->add($f);
+
+		$f = $inputfields->InputfieldCheckbox;
+		$f->attr('name', 'interventionDebug');
+		$f->label = $this->_('Enable Debug Logging');
+		$f->description = $this->_('Log resize operations and errors to Setup > Logs > intervention-image.');
+		$f->attr('checked', $this->interventionDebug ? 'checked' : '');
+		$f->icon = 'bug';
+		$inputfields->add($f);
+	}
+}
