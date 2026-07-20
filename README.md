@@ -3,6 +3,8 @@
 ProcessWire `ImageSizerEngine` module that uses [Intervention Image v4](https://image.intervention.io/) as
 the image manipulation library, with a selectable backend driver: **GD**, **Imagick**, or **libvips**.
 
+![ImageSizerEngineIntervention](assets/ImageSizerEngineIntervention.png)
+
 ## Features
 
 - Drop-in `ImageSizerEngine` — works with the normal `$page->image->size()` API, no template changes needed.
